@@ -253,7 +253,10 @@ pub fn run() {
                     .header("Cache-Control", "no-store")
                     .body(img.data)
                     .unwrap_or_else(|_| not_found()),
-                None => not_found(),
+                None => {
+                    tracing::warn!(path, "terminal image request did not match a stored image");
+                    not_found()
+                }
             }
         })
         // Local files the browser widget shows (`tmuxy widget browser`) — an
