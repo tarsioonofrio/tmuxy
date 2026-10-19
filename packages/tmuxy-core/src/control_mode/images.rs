@@ -5,7 +5,7 @@
 //!
 //! - **iTerm2 Inline Images** — `ESC ] 1337 ; File=<args> : <base64> BEL/ST`
 //! - **Kitty Graphics Protocol** — `ESC _ G<keys>;<base64-payload> ESC \`
-//!   (APC sequence, supports chunked transfer via `m=1`/`m=0`)
+//!   (APC sequence, supports chunked transfer where the final chunk may omit `m=0`)
 //! - **Sixel** — `ESC P <params> q <sixel data> ESC \` (DCS), decoded to PNG
 //!   via the `icy_sixel` pure-Rust decoder.
 //!
@@ -20,6 +20,7 @@
 
 use base64::Engine;
 use serde::{Deserialize, Serialize};
+use std::io::Read;
 
 // `std::time::Instant::now()` panics on wasm32; web-time backs it with
 // performance.now() in the browser (the same arrangement as `state.rs`).
@@ -71,9 +72,9 @@ pub struct StoredImage {
 
 /// In-flight kitty chunked transfer (across multiple APC sequences).
 ///
-/// Kitty splits large payloads into chunks with `m=1` (more) and `m=0` (last).
-/// Subsequent chunks may omit metadata (other than `i=`/`m=`), so we cache the
-/// first chunk's transmission keys on the entry.
+/// Kitty splits large payloads into chunks with `m=1` (more); the final chunk
+/// may mark `m=0` or omit `m` entirely. Subsequent chunks may omit metadata
+/// (other than `i=`/`m=`), so we cache the first chunk's transmission keys.
 #[derive(Debug)]
 struct KittyChunked {
     /// When the transfer was opened; see `MAX_CHUNKED_AGE`.
@@ -82,6 +83,7 @@ struct KittyChunked {
     payload: String,
     /// Image format (`f=`) from the first chunk: 32 = RGBA, 24 = RGB, 100 = PNG.
     format: u32,
+    compression: Option<u8>,
     /// Source pixel width (`s=`).
     src_width: u32,
     /// Source pixel height (`v=`).
@@ -90,6 +92,8 @@ struct KittyChunked {
     rows: u32,
     /// Display columns (`c=`) — 0 if unset.
     cols: u32,
+    /// The transfer creates a virtual placement represented by Unicode cells.
+    unicode_placeholder: bool,
 }
 
 /// Per-pane image parser state.
@@ -105,6 +109,10 @@ pub struct ImageParser {
     kitty_chunks: std::collections::HashMap<u32, KittyChunked>,
     /// The order transfers were opened in, so the cap evicts the oldest.
     kitty_chunk_order: std::collections::VecDeque<u32>,
+    /// Kitty protocol image ids mapped to the ids used by the HTTP image store.
+    kitty_image_ids: std::collections::HashMap<u32, u32>,
+    /// Internal image ids whose screen placement comes from Unicode cells.
+    kitty_virtual_images: std::collections::HashSet<u32>,
     /// An image escape (iTerm2/kitty/sixel) split across `%output` chunks,
     /// carried into the next `process()` call so a large payload isn't torn —
     /// its header rendered as garbage text and the image dropped.
@@ -126,6 +134,7 @@ const MAX_PENDING_IMAGE: usize = 8 * 1024 * 1024;
 /// different thing: a chunked transfer (`m=1`) is assembled here, across many
 /// well-formed escapes, and nothing was watching that total.
 const MAX_CHUNKED_IMAGE: usize = MAX_PENDING_IMAGE;
+const MAX_DECODED_IMAGE_BYTES: usize = 64 * 1024 * 1024;
 
 /// How many chunked transfers may be in flight at once.
 ///
@@ -176,6 +185,8 @@ impl ImageParser {
         self.main_screen_placements = None;
         self.kitty_chunks.clear();
         self.kitty_chunk_order.clear();
+        self.kitty_image_ids.clear();
+        self.kitty_virtual_images.clear();
         self.cursor_row = 0;
         self.cursor_col = 0;
         self.pending.clear();
@@ -226,6 +237,56 @@ impl ImageParser {
     pub fn update_cursor(&mut self, row: u16, col: u16) {
         self.cursor_row = row;
         self.cursor_col = col;
+    }
+
+    /// Rebuild Kitty Unicode-placeholder placements from the emulated screen.
+    /// The placeholders are ordinary terminal cells, so the terminal emulator
+    /// has already applied cursor movement, wrapping and scrolling for us.
+    pub fn update_kitty_placeholders(&mut self, screen: &vt100::Screen) {
+        self.placements
+            .retain(|placement| !self.kitty_virtual_images.contains(&placement.id));
+
+        let (rows, cols) = screen.size();
+        let mut bounds: std::collections::HashMap<u32, (u16, u16, u16, u16)> =
+            std::collections::HashMap::new();
+        for row in 0..rows {
+            for col in 0..cols {
+                let Some(cell) = screen.cell(row, col) else {
+                    continue;
+                };
+                if !cell.contents().starts_with('\u{10eeee}') {
+                    continue;
+                }
+                let Some(image_id) = kitty_placeholder_image_id(cell) else {
+                    continue;
+                };
+                let Some(&stored_id) = self.kitty_image_ids.get(&image_id) else {
+                    continue;
+                };
+                bounds
+                    .entry(stored_id)
+                    .and_modify(|(top, left, bottom, right)| {
+                        *top = (*top).min(row);
+                        *left = (*left).min(col);
+                        *bottom = (*bottom).max(row);
+                        *right = (*right).max(col);
+                    })
+                    .or_insert((row, col, row, col));
+            }
+        }
+
+        for (id, (top, left, bottom, right)) in bounds {
+            self.kitty_virtual_images.insert(id);
+            self.place(ImagePlacement {
+                id,
+                row: top,
+                col: left,
+                width_cells: right.saturating_sub(left) + 1,
+                height_cells: bottom.saturating_sub(top) + 1,
+                protocol: ImageProtocol::Kitty,
+                stretch: false,
+            });
+        }
     }
 
     /// Process raw output bytes, extracting image sequences from any of the
@@ -509,13 +570,14 @@ impl ImageParser {
     // Keys we honour:
     //   a   action (T=transmit+display, t=transmit only, p=display, d=delete)
     //   f   format (24=RGB, 32=RGBA, 100=PNG); default 32 per spec
+    //   o   optional compression (`z` = ZLIB)
     //   t   transmission medium (d=direct base64; only direct supported here)
     //   i   image id (used to coalesce chunked transfers)
     //   m   more-chunks flag (1=more, 0=last); absent = single-chunk
     //   s,v source image pixel width/height (required for RGB/RGBA)
     //   r,c display rows/cols on the terminal grid
     //
-    // Everything else (z, X, Y, w, h, q, etc.) is parsed-and-ignored for
+    // Everything else (X, Y, w, h, q, etc.) is parsed-and-ignored for
     // now — we render the full image at the cursor position without
     // sub-region cropping.
     // -------------------------------------------------------------------
@@ -548,14 +610,16 @@ impl ImageParser {
 
         let mut action = b'T';
         let mut format: u32 = 32;
+        let mut compression = None;
         let mut transmission = b'd';
-        let mut image_id: u32 = 0;
+        let mut image_id: Option<u32> = None;
         let mut more_chunks: Option<bool> = None;
         let mut src_w: u32 = 0;
         let mut src_h: u32 = 0;
         let mut rows: u32 = 0;
         let mut cols: u32 = 0;
         let mut delete_what: u8 = b'a';
+        let mut unicode_placeholder = false;
 
         for kv in keys_str.split(',') {
             let mut it = kv.splitn(2, '=');
@@ -564,14 +628,16 @@ impl ImageParser {
             match k {
                 "a" => action = v.bytes().next().unwrap_or(b'T'),
                 "f" => format = v.parse().unwrap_or(32),
+                "o" => compression = v.bytes().next(),
                 "t" => transmission = v.bytes().next().unwrap_or(b'd'),
-                "i" => image_id = v.parse().unwrap_or(0),
+                "i" => image_id = v.parse().ok(),
                 "m" => more_chunks = Some(v == "1"),
                 "s" => src_w = v.parse().unwrap_or(0),
                 "v" => src_h = v.parse().unwrap_or(0),
                 "r" => rows = v.parse().unwrap_or(0),
                 "c" => cols = v.parse().unwrap_or(0),
                 "d" => delete_what = v.bytes().next().unwrap_or(b'a'),
+                "U" => unicode_placeholder = v == "1",
                 _ => {}
             }
         }
@@ -603,9 +669,26 @@ impl ImageParser {
 
         let payload_str = std::str::from_utf8(payload_part).ok()?;
 
-        // Chunked transfer (m=1 / m=0): accumulate; only finish on m=0 or
-        // when no `m` key is present (single-chunk).
-        let entry = if let Some(more) = more_chunks {
+        // Kitty only requires `i=` on the first chunk. Later chunks can carry
+        // just `m=` (and `q=`), including the final chunk, so associate an
+        // id-less packet with the sole transfer in flight. The protocol does
+        // not interleave transfers; if malformed input leaves several open,
+        // consuming an ambiguous continuation is safer than corrupting one.
+        let image_id = match image_id {
+            Some(id) => id,
+            None if self.kitty_chunks.len() == 1 => *self.kitty_chunks.keys().next()?,
+            None if self.kitty_chunks.is_empty() => 0,
+            None => return Some((consumed, None)),
+        };
+
+        // Chunked transfer: accumulate while m=1, then finish on m=0 or on a
+        // metadata-light final packet that omits `m`.
+        // Kitty 0.48 emits `m=1` on the first chunk and omits `m=0` from the
+        // final chunk. Treat a packet without `m` as the end of a transfer
+        // when it matches an in-flight image id; otherwise it is a standalone
+        // image as usual.
+        let is_chunked = more_chunks.is_some() || self.kitty_chunks.contains_key(&image_id);
+        let entry = if is_chunked {
             // SEC-03: the payload comes from pane output, so the number of
             // open transfers, the size of each and how long one may stay open
             // are all bounded.
@@ -627,10 +710,12 @@ impl ImageParser {
                     opened_at: Instant::now(),
                     payload: String::new(),
                     format,
+                    compression,
                     src_width: src_w,
                     src_height: src_h,
                     rows,
                     cols,
+                    unicode_placeholder,
                 });
             if entry.payload.len().saturating_add(payload_str.len()) > MAX_CHUNKED_IMAGE {
                 // Over the cap: drop the transfer rather than keep growing it.
@@ -641,7 +726,7 @@ impl ImageParser {
                 return Some((consumed, None));
             }
             entry.payload.push_str(payload_str);
-            if more {
+            if more_chunks == Some(true) {
                 return Some((consumed, None));
             }
             self.kitty_chunk_order.retain(|id| *id != image_id);
@@ -651,14 +736,24 @@ impl ImageParser {
                 opened_at: Instant::now(),
                 payload: payload_str.to_string(),
                 format,
+                compression,
                 src_width: src_w,
                 src_height: src_h,
                 rows,
                 cols,
+                unicode_placeholder,
             }
         };
 
-        let raw = base64_decode(&entry.payload);
+        let encoded = base64_decode(&entry.payload);
+        let raw = match entry.compression {
+            None => encoded,
+            Some(b'z') => match zlib_decompress_bounded(&encoded) {
+                Some(decoded) => decoded,
+                None => return Some((consumed, None)),
+            },
+            Some(_) => return Some((consumed, None)),
+        };
         if raw.is_empty() {
             return Some((consumed, None));
         }
@@ -683,15 +778,20 @@ impl ImageParser {
         let (width_cells, height_cells) = self.kitty_cell_dims(&entry);
         let id = self.next_id;
         self.next_id += 1;
-        self.place(ImagePlacement {
-            id,
-            row: self.cursor_row,
-            col: self.cursor_col,
-            width_cells,
-            height_cells,
-            protocol: ImageProtocol::Kitty,
-            stretch: false,
-        });
+        self.kitty_image_ids.insert(image_id, id);
+        if entry.unicode_placeholder {
+            self.kitty_virtual_images.insert(id);
+        } else {
+            self.place(ImagePlacement {
+                id,
+                row: self.cursor_row,
+                col: self.cursor_col,
+                width_cells,
+                height_cells,
+                protocol: ImageProtocol::Kitty,
+                stretch: false,
+            });
+        }
 
         Some((consumed, Some((id, stored))))
     }
@@ -801,6 +901,44 @@ impl ImageParser {
             )),
         ))
     }
+}
+
+fn kitty_placeholder_image_id(cell: &vt100::Cell) -> Option<u32> {
+    let mut chars = cell.contents().chars();
+    if chars.next()? != '\u{10eeee}' {
+        return None;
+    }
+    let marks: Vec<u32> = chars.filter_map(kitty_diacritic_value).collect();
+    let low = match cell.fgcolor() {
+        vt100::Color::Rgb(r, g, b) => (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b),
+        vt100::Color::Idx(id) => u32::from(id),
+        vt100::Color::Default => return None,
+    };
+    Some(low | (marks.get(2).copied().unwrap_or(0) << 24))
+}
+
+/// The initial entries from Kitty's rowcolumn-diacritics.txt. These are the
+/// values commonly used for terminal-sized images and for the image-id high byte.
+fn kitty_diacritic_value(ch: char) -> Option<u32> {
+    const MARKS: &[char] = &[
+        '\u{0305}', '\u{030d}', '\u{030e}', '\u{0310}', '\u{0312}', '\u{033d}', '\u{033e}',
+        '\u{033f}', '\u{0346}', '\u{034a}', '\u{034b}', '\u{034c}', '\u{0350}', '\u{0351}',
+        '\u{0352}', '\u{0357}', '\u{035b}', '\u{0363}', '\u{0364}', '\u{0365}', '\u{0366}',
+        '\u{0367}', '\u{0368}', '\u{0369}', '\u{036a}', '\u{036b}', '\u{036c}', '\u{036d}',
+        '\u{036e}', '\u{036f}', '\u{0483}', '\u{0484}', '\u{0485}', '\u{0486}', '\u{0487}',
+        '\u{0592}', '\u{0593}', '\u{0594}', '\u{0595}', '\u{0597}', '\u{0598}', '\u{0599}',
+        '\u{059c}', '\u{059d}', '\u{059e}', '\u{059f}', '\u{05a0}', '\u{05a1}', '\u{05a8}',
+        '\u{05a9}', '\u{05ab}', '\u{05ac}', '\u{05af}', '\u{05c4}', '\u{0610}', '\u{0611}',
+        '\u{0612}', '\u{0613}', '\u{0614}', '\u{0615}', '\u{0616}', '\u{0617}', '\u{0657}',
+        '\u{0658}', '\u{0659}', '\u{065a}', '\u{065b}', '\u{065d}', '\u{065e}', '\u{06d6}',
+        '\u{06d7}', '\u{06d8}', '\u{06d9}', '\u{06da}', '\u{06db}', '\u{06dc}', '\u{06df}',
+        '\u{06e0}', '\u{06e1}', '\u{06e2}', '\u{06e4}', '\u{06e7}', '\u{06e8}', '\u{06eb}',
+        '\u{06ec}',
+    ];
+    MARKS
+        .iter()
+        .position(|&mark| mark == ch)
+        .map(|value| value as u32)
 }
 
 // -------------------------------------------------------------------
@@ -976,6 +1114,16 @@ fn rgba_to_png(pixels: &[u8], format: u32, width: u32, height: u32) -> Option<Ve
     Some(out)
 }
 
+fn zlib_decompress_bounded(compressed: &[u8]) -> Option<Vec<u8>> {
+    let decoder = flate2::read::ZlibDecoder::new(compressed);
+    let mut decoded = Vec::new();
+    decoder
+        .take((MAX_DECODED_IMAGE_BYTES + 1) as u64)
+        .read_to_end(&mut decoded)
+        .ok()?;
+    (decoded.len() <= MAX_DECODED_IMAGE_BYTES).then_some(decoded)
+}
+
 // -------------------------------------------------------------------
 // Tests
 // -------------------------------------------------------------------
@@ -1095,6 +1243,40 @@ mod tests {
         assert_eq!(p.height_cells, 2);
         assert_eq!(result.new_images.len(), 1);
         assert_eq!(result.new_images[0].1.mime_type, "image/png");
+    }
+
+    #[test]
+    fn kitty_unicode_placeholders_resolve_virtual_placements() {
+        let mut parser = ImageParser::new();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(b"\x89PNG\r\n\x1a\n");
+        let image = format!(
+            "\x1b_Ga=T,U=1,f=100,i=1258291242,c=2,r=2,m=1;{}\x1b\\",
+            &b64[..4]
+        );
+        let mut terminal = vt100::Parser::new(4, 8, 0);
+        let first = parser.process(image.as_bytes());
+        assert!(first.clean_bytes.is_empty());
+        assert!(first.new_images.is_empty());
+        let parsed = parser.process(format!("\x1b_Ga=T;{}\x1b\\", &b64[4..]).as_bytes());
+        assert_eq!(parsed.new_images.len(), 1);
+        assert!(
+            parser.placements.is_empty(),
+            "virtual transmit has no screen anchor"
+        );
+
+        terminal.process(
+            "\x1b[38;5;42m\u{10eeee}\u{0305}\u{0305}\u{06dc}\u{10eeee}\u{0305}\u{030d}\u{06dc}\r\n\
+             \u{10eeee}\u{030d}\u{0305}\u{06dc}\u{10eeee}\u{030d}\u{030d}\u{06dc}\x1b[39m"
+                .as_bytes(),
+        );
+        parser.update_kitty_placeholders(terminal.screen());
+
+        assert_eq!(parser.placements.len(), 1);
+        let placement = &parser.placements[0];
+        assert_eq!((placement.row, placement.col), (0, 0));
+        assert_eq!((placement.width_cells, placement.height_cells), (2, 2));
+        assert_eq!(placement.protocol, ImageProtocol::Kitty);
+        assert_eq!(crate::screen_cell_char(terminal.screen(), 0, 0), " ");
     }
 
     #[test]
@@ -1250,6 +1432,50 @@ mod tests {
         assert_eq!(parser.placements.len(), 1);
         assert_eq!(parser.placements[0].protocol, ImageProtocol::Kitty);
         assert_eq!(r2.new_images[0].1.mime_type, "image/png");
+    }
+
+    #[test]
+    fn kitty_compressed_final_chunk_without_metadata_survives_tmux_passthrough() {
+        use std::io::{Cursor, Write};
+
+        let pixels = [255, 0, 0, 0, 255, 0]; // 2x1 RGB: red, green
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&pixels).unwrap();
+        let payload = base64::engine::general_purpose::STANDARD.encode(encoder.finish().unwrap());
+        let split1 = (payload.len() / 3) / 4 * 4;
+        let split2 = (payload.len() * 2 / 3) / 4 * 4;
+        let first = &payload[..split1];
+        let middle = &payload[split1..split2];
+        let final_chunk = &payload[split2..];
+        let wrap = |apc: String| format!("\x1bPtmux;{}\x1b\\", apc.replace('\x1b', "\x1b\x1b"));
+
+        let mut parser = ImageParser::new();
+        let first = wrap(format!(
+            "\x1b_Ga=T,q=2,f=24,o=z,m=1,C=1,s=2,v=1,i=73;{first}\x1b\\"
+        ));
+        let result = parser.process(first.as_bytes());
+        assert!(result.new_images.is_empty());
+        assert!(result.clean_bytes.is_empty());
+
+        // Kitty's continuation packets may omit the image id; the final
+        // packet can omit m=0 and all image metadata as well.
+        let middle = wrap(format!("\x1b_Ga=T,q=2,m=1;{middle}\x1b\\"));
+        let result = parser.process(middle.as_bytes());
+        assert!(result.new_images.is_empty());
+        assert!(result.clean_bytes.is_empty());
+
+        let final_chunk = wrap(format!("\x1b_Ga=T,q=2;{final_chunk}\x1b\\"));
+        let result = parser.process(final_chunk.as_bytes());
+        assert!(result.clean_bytes.is_empty());
+        assert_eq!(result.new_images.len(), 1);
+        assert_eq!(result.new_images[0].1.mime_type, "image/png");
+
+        let decoder = png::Decoder::new(Cursor::new(&result.new_images[0].1.data));
+        let mut reader = decoder.read_info().unwrap();
+        let mut decoded = vec![0; reader.output_buffer_size().unwrap()];
+        let frame = reader.next_frame(&mut decoded).unwrap();
+        assert_eq!(&decoded[..frame.buffer_size()], &pixels);
     }
 
     /// SEC-03. A chunked transfer is assembled across many well-formed

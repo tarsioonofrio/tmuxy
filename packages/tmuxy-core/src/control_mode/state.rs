@@ -682,6 +682,12 @@ impl PaneState {
         // Process through terminal emulator, recording hyperlink cells as we go
         self.feed_terminal(osc);
 
+        // Kitty's tmux passthrough mode draws image positions as Unicode
+        // placeholders. Resolve them against the grid after vt100 has applied
+        // cursor movement, wrapping and scrolling.
+        self.image_parser
+            .update_kitty_placeholders(self.terminal.screen());
+
         // Derive alternate_on and mouse_any_flag from the vt100 parser state.
         // This is more reliable than polling list-panes, as it updates immediately
         // when the application sends the escape sequence.
@@ -3597,6 +3603,38 @@ mod tests {
             pane.terminal.screen().hide_cursor(),
             "the rebuilt parser lost the hidden cursor"
         );
+    }
+
+    #[test]
+    fn kitty_tmux_passthrough_placeholders_render_as_an_image() {
+        let mut pane = PaneState::new(pid("%1"), 40, 10);
+        let b64 = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            b"\x89PNG\r\n\x1a\n",
+        );
+        let apc = format!("\x1b_Ga=T,U=1,f=100,i=42,c=2,r=2;{b64}\x1b\\");
+        let passthrough = format!("\x1bPtmux;{}\x1b\\", apc.replace('\x1b', "\x1b\x1b"));
+        pane.process_output(passthrough.as_bytes());
+        pane.process_output(
+            "\x1b[38;2;0;0;42m\u{10eeee}\u{0305}\u{0305}\u{10eeee}\u{0305}\u{030d}\r\n\
+             \u{10eeee}\u{030d}\u{0305}\u{10eeee}\u{030d}\u{030d}\x1b[39m"
+                .as_bytes(),
+        );
+
+        let content = pane.get_content();
+        let text: String = content
+            .iter()
+            .flat_map(|row| row.iter().map(|cell| cell.char.clone()))
+            .collect();
+        assert!(
+            !text.contains('\u{10eeee}'),
+            "placeholders stay out of text"
+        );
+        assert_eq!(pane.image_parser.placements.len(), 1);
+        let placement = &pane.image_parser.placements[0];
+        assert_eq!((placement.row, placement.col), (0, 0));
+        assert_eq!((placement.width_cells, placement.height_cells), (2, 2));
+        assert!(pane.image_store.contains_key(&placement.id));
     }
 
     /// A program that redraws on SIGWINCH (`tmuxy browser`) is in the
